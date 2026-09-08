@@ -1,0 +1,10 @@
+{
+  "name": "stock-breakout-api",
+  "version": "1.0.0",
+  "description": "Stock Breakout Detection API",
+  "scripts": {
+    "build": "echo 'Build completed'"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
