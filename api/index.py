@@ -7,6 +7,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
+import requests
+import json
 
 app = FastAPI(title="Stock Breakout API", version="1.0.0")
 
@@ -41,62 +43,88 @@ class BreakoutResponse(BaseModel):
     volume_confirmation: bool
     timestamp: str
 
-# --- Improved Stock Data Fetcher ---
+# --- Yahoo Finance with Custom Headers ---
+def fetch_stock_data_with_headers(symbol: str, period: str = '6mo'):
+    """Fetch stock data with proper headers to avoid blocking"""
+    try:
+        # Create session with headers
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        })
+        
+        # Use yfinance with session
+        yf.set_session(session)
+        
+        # Get ticker
+        ticker = yf.Ticker(symbol)
+        
+        # Get info first to validate
+        info = ticker.info
+        if not info or 'regularMarketPrice' not in info:
+            # Try alternative method
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period=period, progress=False)
+            if data.empty:
+                raise ValueError(f"No data found for {symbol}")
+            return data
+        
+        # Get historical data
+        data = ticker.history(period=period, progress=False)
+        if data.empty:
+            raise ValueError(f"No data found for {symbol}")
+        
+        return data
+        
+    except Exception as e:
+        print(f"Error fetching {symbol}: {str(e)}")
+        raise HTTPException(status_code=404, detail=f"No data found for {symbol}. Please check the symbol.")
+
 def fetch_stock_data(symbol: str, period: str = '6mo'):
-    """Fetch stock data from Yahoo Finance with retry logic"""
-    
-    # Clean and validate symbol
+    """Main fetch function with fallback options"""
     symbol = symbol.strip().upper()
     
-    # If symbol doesn't have suffix, try both NSE and BSE
-    if '.' not in symbol:
-        symbols_to_try = [f"{symbol}.NS", f"{symbol}.BO"]
+    # Try multiple formats
+    symbols_to_try = []
+    
+    if '.' in symbol:
+        symbols_to_try.append(symbol)
     else:
-        symbols_to_try = [symbol]
+        # Try both exchanges
+        symbols_to_try.append(f"{symbol}.NS")
+        symbols_to_try.append(f"{symbol}.BO")
     
     last_error = None
     
     for try_symbol in symbols_to_try:
         try:
-            print(f"Trying to fetch: {try_symbol}")
+            print(f"Trying: {try_symbol}")
             
-            # Create ticker with proper user-agent
-            stock = yf.Ticker(try_symbol)
-            
-            # Try to get info first to validate symbol
-            info = stock.info
-            if not info or 'regularMarketPrice' not in info:
-                print(f"No market data for {try_symbol}")
-                continue
-            
-            # Fetch historical data
-            data = stock.history(period=period, progress=False)
-            
+            # Try with headers first
+            data = fetch_stock_data_with_headers(try_symbol, period)
             if not data.empty:
-                print(f"Successfully fetched data for {try_symbol}")
+                print(f"Success: {try_symbol}")
                 return data
-            
+                
         except Exception as e:
             last_error = str(e)
-            print(f"Error with {try_symbol}: {last_error}")
+            print(f"Failed: {try_symbol} - {last_error}")
             continue
     
-    # If we get here, no data was found
     raise HTTPException(
-        status_code=404, 
-        detail=f"No data found for {symbol}. Please check the symbol. Try using format like 'RELIANCE.NS' or 'TCS.BO'"
+        status_code=404,
+        detail=f"No data found for {symbol}. Please try using format like 'RELIANCE.NS' or 'TCS.BO'"
     )
-
-def fetch_stock_data_with_retry(symbol: str, max_retries: int = 3):
-    """Fetch with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            return fetch_stock_data(symbol)
-        except HTTPException as e:
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep(1)  # Wait before retry
-    raise HTTPException(status_code=404, detail=f"Failed to fetch data for {symbol} after {max_retries} attempts")
 
 # --- Analysis Functions ---
 def calculate_pivot_points(data):
@@ -128,7 +156,7 @@ def calculate_dynamic_resistance(data, lookback=20):
     """Calculate dynamic resistance"""
     try:
         if len(data) < lookback:
-            lookback = len(data) // 2
+            lookback = max(len(data) // 2, 5)
             
         rolling_high = data['High'].rolling(window=lookback).max()
         rolling_mean = data['High'].rolling(window=lookback).mean()
@@ -212,7 +240,8 @@ async def root():
             "/popular": "Get popular Indian stocks",
             "/analyze/{symbol}": "Analyze a single stock",
             "/scan": "Scan multiple stocks",
-            "/health": "Health check"
+            "/health": "Health check",
+            "/test": "Test stock availability"
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -221,30 +250,50 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
+@app.get("/test")
+async def test_connection(symbol: str = Query("RELIANCE.NS")):
+    """Test if a stock symbol is accessible"""
+    try:
+        data = fetch_stock_data(symbol, '1d')
+        return {
+            "symbol": symbol,
+            "status": "accessible",
+            "data_points": len(data),
+            "last_price": float(data['Close'].iloc[-1]) if not data.empty else None,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "symbol": symbol,
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
 @app.get("/popular")
 async def get_popular_indian_stocks():
-    """Get a list of popular Indian stocks with NSE and BSE formats"""
+    """Get a list of popular Indian stocks"""
     stocks = [
-        {"symbol": "RELIANCE.NS", "name": "Reliance Industries", "sector": "Oil & Gas", "exchange": "NSE"},
-        {"symbol": "TCS.NS", "name": "Tata Consultancy Services", "sector": "IT", "exchange": "NSE"},
-        {"symbol": "INFY.NS", "name": "Infosys", "sector": "IT", "exchange": "NSE"},
-        {"symbol": "HDFCBANK.NS", "name": "HDFC Bank", "sector": "Banking", "exchange": "NSE"},
-        {"symbol": "ICICIBANK.NS", "name": "ICICI Bank", "sector": "Banking", "exchange": "NSE"},
-        {"symbol": "SBIN.NS", "name": "State Bank of India", "sector": "Banking", "exchange": "NSE"},
-        {"symbol": "BHARTIARTL.NS", "name": "Bharti Airtel", "sector": "Telecom", "exchange": "NSE"},
-        {"symbol": "ITC.NS", "name": "ITC Ltd", "sector": "FMCG", "exchange": "NSE"},
-        {"symbol": "WIPRO.NS", "name": "Wipro", "sector": "IT", "exchange": "NSE"},
-        {"symbol": "HCLTECH.NS", "name": "HCL Technologies", "sector": "IT", "exchange": "NSE"},
-        {"symbol": "ASIANPAINT.NS", "name": "Asian Paints", "sector": "Paint", "exchange": "NSE"},
-        {"symbol": "MARUTI.NS", "name": "Maruti Suzuki", "sector": "Automobile", "exchange": "NSE"},
-        {"symbol": "TATAMOTORS.NS", "name": "Tata Motors", "sector": "Automobile", "exchange": "NSE"},
-        {"symbol": "TITAN.NS", "name": "Titan Company", "sector": "Retail", "exchange": "NSE"},
-        {"symbol": "AXISBANK.NS", "name": "Axis Bank", "sector": "Banking", "exchange": "NSE"},
-        {"symbol": "KOTAKBANK.NS", "name": "Kotak Mahindra Bank", "sector": "Banking", "exchange": "NSE"},
-        {"symbol": "LT.NS", "name": "Larsen & Toubro", "sector": "Construction", "exchange": "NSE"},
-        {"symbol": "HINDUNILVR.NS", "name": "Hindustan Unilever", "sector": "FMCG", "exchange": "NSE"},
-        {"symbol": "SUNPHARMA.NS", "name": "Sun Pharma", "sector": "Pharma", "exchange": "NSE"},
-        {"symbol": "BAJFINANCE.NS", "name": "Bajaj Finance", "sector": "Finance", "exchange": "NSE"}
+        {"symbol": "RELIANCE.NS", "name": "Reliance Industries", "sector": "Oil & Gas"},
+        {"symbol": "TCS.NS", "name": "Tata Consultancy Services", "sector": "IT"},
+        {"symbol": "INFY.NS", "name": "Infosys", "sector": "IT"},
+        {"symbol": "HDFCBANK.NS", "name": "HDFC Bank", "sector": "Banking"},
+        {"symbol": "ICICIBANK.NS", "name": "ICICI Bank", "sector": "Banking"},
+        {"symbol": "SBIN.NS", "name": "State Bank of India", "sector": "Banking"},
+        {"symbol": "BHARTIARTL.NS", "name": "Bharti Airtel", "sector": "Telecom"},
+        {"symbol": "ITC.NS", "name": "ITC Ltd", "sector": "FMCG"},
+        {"symbol": "WIPRO.NS", "name": "Wipro", "sector": "IT"},
+        {"symbol": "HCLTECH.NS", "name": "HCL Technologies", "sector": "IT"},
+        {"symbol": "ASIANPAINT.NS", "name": "Asian Paints", "sector": "Paint"},
+        {"symbol": "MARUTI.NS", "name": "Maruti Suzuki", "sector": "Automobile"},
+        {"symbol": "TATAMOTORS.NS", "name": "Tata Motors", "sector": "Automobile"},
+        {"symbol": "TITAN.NS", "name": "Titan Company", "sector": "Retail"},
+        {"symbol": "AXISBANK.NS", "name": "Axis Bank", "sector": "Banking"},
+        {"symbol": "KOTAKBANK.NS", "name": "Kotak Mahindra Bank", "sector": "Banking"},
+        {"symbol": "LT.NS", "name": "Larsen & Toubro", "sector": "Construction"},
+        {"symbol": "HINDUNILVR.NS", "name": "Hindustan Unilever", "sector": "FMCG"},
+        {"symbol": "SUNPHARMA.NS", "name": "Sun Pharma", "sector": "Pharma"},
+        {"symbol": "BAJFINANCE.NS", "name": "Bajaj Finance", "sector": "Finance"}
     ]
     return {
         "stocks": stocks,
@@ -262,19 +311,12 @@ async def analyze_stock(
         # Clean symbol
         symbol = symbol.strip().upper()
         
-        # If no exchange specified, try .NS (NSE) first
+        # Add .NS if no exchange specified
         if '.' not in symbol:
-            # Try NSE format first
-            try:
-                data = fetch_stock_data(f"{symbol}.NS", period)
-                symbol = f"{symbol}.NS"
-            except:
-                # Try BSE format
-                data = fetch_stock_data(f"{symbol}.BO", period)
-                symbol = f"{symbol}.BO"
-        else:
-            data = fetch_stock_data(symbol, period)
+            symbol = symbol + '.NS'
         
+        # Fetch data
+        data = fetch_stock_data(symbol, period)
         result = detect_breakout(data, symbol)
         
         return BreakoutResponse(
@@ -307,18 +349,16 @@ async def scan_stocks(
     """Scan multiple stocks for breakouts"""
     try:
         stock_list = [s.strip().upper() for s in symbols.split(',')]
-        # Limit to 10 stocks for performance
-        stock_list = stock_list[:10]
+        # Add .NS if needed
+        stock_list = [s if '.' in s else s + '.NS' for s in stock_list]
+        # Limit to 8 stocks for performance
+        stock_list = stock_list[:8]
         
         results = []
         failed_stocks = []
         
         for symbol in stock_list:
             try:
-                # Ensure .NS for NSE stocks
-                if '.' not in symbol:
-                    symbol = symbol + '.NS'
-                
                 data = fetch_stock_data(symbol, '3mo')
                 result = detect_breakout(data, symbol)
                 if result['is_breakout']:
