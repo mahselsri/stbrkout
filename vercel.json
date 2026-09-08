@@ -2,7 +2,7 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/stock.py",
+      "src": "api/index.py",
       "use": "@vercel/python",
       "config": {
         "maxLambdaSize": "10mb",
@@ -13,7 +13,7 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/stock.py"
+      "dest": "api/index.py"
     }
   ]
 }
