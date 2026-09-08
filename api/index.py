@@ -1,26 +1,12 @@
-import sys
-import os
-from datetime import datetime
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import json
-
-# Fix for distutils issue
-try:
-    from fastapi import FastAPI, HTTPException, Query
-    from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel
-    import yfinance as yf
-    import pandas as pd
-    import numpy as np
-except ImportError as e:
-    print(f"Import error: {e}")
-    # Fallback
-    from fastapi import FastAPI, HTTPException, Query
-    from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel
-    import yfinance as yf
-    import pandas as pd
-    import numpy as np
+from datetime import datetime
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import time
 
 app = FastAPI(title="Stock Breakout API", version="1.0.0")
 
@@ -55,18 +41,64 @@ class BreakoutResponse(BaseModel):
     volume_confirmation: bool
     timestamp: str
 
-# --- Helper Functions ---
+# --- Improved Stock Data Fetcher ---
 def fetch_stock_data(symbol: str, period: str = '6mo'):
-    """Fetch stock data from Yahoo Finance"""
-    try:
-        stock = yf.Ticker(symbol)
-        data = stock.history(period=period)
-        if data.empty:
-            raise ValueError(f"No data found for {symbol}")
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Error fetching {symbol}: {str(e)}")
+    """Fetch stock data from Yahoo Finance with retry logic"""
+    
+    # Clean and validate symbol
+    symbol = symbol.strip().upper()
+    
+    # If symbol doesn't have suffix, try both NSE and BSE
+    if '.' not in symbol:
+        symbols_to_try = [f"{symbol}.NS", f"{symbol}.BO"]
+    else:
+        symbols_to_try = [symbol]
+    
+    last_error = None
+    
+    for try_symbol in symbols_to_try:
+        try:
+            print(f"Trying to fetch: {try_symbol}")
+            
+            # Create ticker with proper user-agent
+            stock = yf.Ticker(try_symbol)
+            
+            # Try to get info first to validate symbol
+            info = stock.info
+            if not info or 'regularMarketPrice' not in info:
+                print(f"No market data for {try_symbol}")
+                continue
+            
+            # Fetch historical data
+            data = stock.history(period=period, progress=False)
+            
+            if not data.empty:
+                print(f"Successfully fetched data for {try_symbol}")
+                return data
+            
+        except Exception as e:
+            last_error = str(e)
+            print(f"Error with {try_symbol}: {last_error}")
+            continue
+    
+    # If we get here, no data was found
+    raise HTTPException(
+        status_code=404, 
+        detail=f"No data found for {symbol}. Please check the symbol. Try using format like 'RELIANCE.NS' or 'TCS.BO'"
+    )
 
+def fetch_stock_data_with_retry(symbol: str, max_retries: int = 3):
+    """Fetch with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            return fetch_stock_data(symbol)
+        except HTTPException as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(1)  # Wait before retry
+    raise HTTPException(status_code=404, detail=f"Failed to fetch data for {symbol} after {max_retries} attempts")
+
+# --- Analysis Functions ---
 def calculate_pivot_points(data):
     """Calculate pivot points and resistance levels"""
     try:
@@ -93,8 +125,11 @@ def calculate_pivot_points(data):
         return {'pivot': 0, 'r1': 0, 'r2': 0, 'r3': 0}
 
 def calculate_dynamic_resistance(data, lookback=20):
-    """Calculate dynamic resistance using moving averages"""
+    """Calculate dynamic resistance"""
     try:
+        if len(data) < lookback:
+            lookback = len(data) // 2
+            
         rolling_high = data['High'].rolling(window=lookback).max()
         rolling_mean = data['High'].rolling(window=lookback).mean()
         rolling_std = data['High'].rolling(window=lookback).std()
@@ -125,28 +160,28 @@ def detect_breakout(data, symbol):
         previous_close = round(float(data['Close'].iloc[-2]), 2)
         
         # Volume confirmation
-        avg_volume = float(data['Volume'].rolling(window=20).mean().iloc[-1])
+        avg_volume = float(data['Volume'].rolling(window=20).mean().iloc[-1]) if len(data) >= 20 else float(data['Volume'].mean())
         current_volume = float(data['Volume'].iloc[-1])
-        volume_confirmation = current_volume > avg_volume * 1.5
+        volume_confirmation = current_volume > avg_volume * 1.5 if avg_volume > 0 else False
         
         # Check breakouts
         breakouts = []
         
-        if current_price > resistance['r1']:
+        if current_price > resistance['r1'] and resistance['r1'] > 0:
             breakouts.append({
                 'level': 'R1',
                 'value': resistance['r1'],
                 'breakout_percent': round(((current_price - resistance['r1']) / resistance['r1']) * 100, 2)
             })
         
-        if current_price > resistance['r2']:
+        if current_price > resistance['r2'] and resistance['r2'] > 0:
             breakouts.append({
                 'level': 'R2',
                 'value': resistance['r2'],
                 'breakout_percent': round(((current_price - resistance['r2']) / resistance['r2']) * 100, 2)
             })
         
-        if current_price > resistance['r3']:
+        if current_price > resistance['r3'] and resistance['r3'] > 0:
             breakouts.append({
                 'level': 'R3',
                 'value': resistance['r3'],
@@ -169,7 +204,6 @@ def detect_breakout(data, symbol):
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "message": "Stock Breakout Detection API",
         "version": "1.0.0",
@@ -185,41 +219,32 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/popular")
 async def get_popular_indian_stocks():
-    """Get a list of popular Indian stocks"""
+    """Get a list of popular Indian stocks with NSE and BSE formats"""
     stocks = [
-        {"symbol": "RELIANCE.NS", "name": "Reliance Industries", "sector": "Oil & Gas"},
-        {"symbol": "TCS.NS", "name": "Tata Consultancy Services", "sector": "IT"},
-        {"symbol": "INFY.NS", "name": "Infosys", "sector": "IT"},
-        {"symbol": "HDFCBANK.NS", "name": "HDFC Bank", "sector": "Banking"},
-        {"symbol": "ICICIBANK.NS", "name": "ICICI Bank", "sector": "Banking"},
-        {"symbol": "SBIN.NS", "name": "State Bank of India", "sector": "Banking"},
-        {"symbol": "BHARTIARTL.NS", "name": "Bharti Airtel", "sector": "Telecom"},
-        {"symbol": "ITC.NS", "name": "ITC Ltd", "sector": "FMCG"},
-        {"symbol": "WIPRO.NS", "name": "Wipro", "sector": "IT"},
-        {"symbol": "HCLTECH.NS", "name": "HCL Technologies", "sector": "IT"},
-        {"symbol": "ASIANPAINT.NS", "name": "Asian Paints", "sector": "Paint"},
-        {"symbol": "MARUTI.NS", "name": "Maruti Suzuki", "sector": "Automobile"},
-        {"symbol": "TATAMOTORS.NS", "name": "Tata Motors", "sector": "Automobile"},
-        {"symbol": "TITAN.NS", "name": "Titan Company", "sector": "Retail"},
-        {"symbol": "AXISBANK.NS", "name": "Axis Bank", "sector": "Banking"},
-        {"symbol": "KOTAKBANK.NS", "name": "Kotak Mahindra Bank", "sector": "Banking"},
-        {"symbol": "LT.NS", "name": "Larsen & Toubro", "sector": "Construction"},
-        {"symbol": "HINDUNILVR.NS", "name": "Hindustan Unilever", "sector": "FMCG"},
-        {"symbol": "SUNPHARMA.NS", "name": "Sun Pharma", "sector": "Pharma"},
-        {"symbol": "BAJFINANCE.NS", "name": "Bajaj Finance", "sector": "Finance"},
-        {"symbol": "ADANIENT.NS", "name": "Adani Enterprises", "sector": "Conglomerate"},
-        {"symbol": "HDFC.NS", "name": "HDFC Ltd", "sector": "Finance"},
-        {"symbol": "NTPC.NS", "name": "NTPC", "sector": "Energy"},
-        {"symbol": "POWERGRID.NS", "name": "Power Grid", "sector": "Energy"},
-        {"symbol": "M&M.NS", "name": "Mahindra & Mahindra", "sector": "Automobile"}
+        {"symbol": "RELIANCE.NS", "name": "Reliance Industries", "sector": "Oil & Gas", "exchange": "NSE"},
+        {"symbol": "TCS.NS", "name": "Tata Consultancy Services", "sector": "IT", "exchange": "NSE"},
+        {"symbol": "INFY.NS", "name": "Infosys", "sector": "IT", "exchange": "NSE"},
+        {"symbol": "HDFCBANK.NS", "name": "HDFC Bank", "sector": "Banking", "exchange": "NSE"},
+        {"symbol": "ICICIBANK.NS", "name": "ICICI Bank", "sector": "Banking", "exchange": "NSE"},
+        {"symbol": "SBIN.NS", "name": "State Bank of India", "sector": "Banking", "exchange": "NSE"},
+        {"symbol": "BHARTIARTL.NS", "name": "Bharti Airtel", "sector": "Telecom", "exchange": "NSE"},
+        {"symbol": "ITC.NS", "name": "ITC Ltd", "sector": "FMCG", "exchange": "NSE"},
+        {"symbol": "WIPRO.NS", "name": "Wipro", "sector": "IT", "exchange": "NSE"},
+        {"symbol": "HCLTECH.NS", "name": "HCL Technologies", "sector": "IT", "exchange": "NSE"},
+        {"symbol": "ASIANPAINT.NS", "name": "Asian Paints", "sector": "Paint", "exchange": "NSE"},
+        {"symbol": "MARUTI.NS", "name": "Maruti Suzuki", "sector": "Automobile", "exchange": "NSE"},
+        {"symbol": "TATAMOTORS.NS", "name": "Tata Motors", "sector": "Automobile", "exchange": "NSE"},
+        {"symbol": "TITAN.NS", "name": "Titan Company", "sector": "Retail", "exchange": "NSE"},
+        {"symbol": "AXISBANK.NS", "name": "Axis Bank", "sector": "Banking", "exchange": "NSE"},
+        {"symbol": "KOTAKBANK.NS", "name": "Kotak Mahindra Bank", "sector": "Banking", "exchange": "NSE"},
+        {"symbol": "LT.NS", "name": "Larsen & Toubro", "sector": "Construction", "exchange": "NSE"},
+        {"symbol": "HINDUNILVR.NS", "name": "Hindustan Unilever", "sector": "FMCG", "exchange": "NSE"},
+        {"symbol": "SUNPHARMA.NS", "name": "Sun Pharma", "sector": "Pharma", "exchange": "NSE"},
+        {"symbol": "BAJFINANCE.NS", "name": "Bajaj Finance", "sector": "Finance", "exchange": "NSE"}
     ]
     return {
         "stocks": stocks,
@@ -236,11 +261,20 @@ async def analyze_stock(
     try:
         # Clean symbol
         symbol = symbol.strip().upper()
-        # Add .NS if not present (for NSE stocks)
-        if not symbol.endswith('.NS') and '.' not in symbol:
-            symbol = symbol + '.NS'
         
-        data = fetch_stock_data(symbol, period)
+        # If no exchange specified, try .NS (NSE) first
+        if '.' not in symbol:
+            # Try NSE format first
+            try:
+                data = fetch_stock_data(f"{symbol}.NS", period)
+                symbol = f"{symbol}.NS"
+            except:
+                # Try BSE format
+                data = fetch_stock_data(f"{symbol}.BO", period)
+                symbol = f"{symbol}.BO"
+        else:
+            data = fetch_stock_data(symbol, period)
+        
         result = detect_breakout(data, symbol)
         
         return BreakoutResponse(
@@ -273,15 +307,18 @@ async def scan_stocks(
     """Scan multiple stocks for breakouts"""
     try:
         stock_list = [s.strip().upper() for s in symbols.split(',')]
-        # Ensure .NS suffix
-        stock_list = [s if s.endswith('.NS') else s + '.NS' for s in stock_list]
-        
         # Limit to 10 stocks for performance
         stock_list = stock_list[:10]
         
         results = []
+        failed_stocks = []
+        
         for symbol in stock_list:
             try:
+                # Ensure .NS for NSE stocks
+                if '.' not in symbol:
+                    symbol = symbol + '.NS'
+                
                 data = fetch_stock_data(symbol, '3mo')
                 result = detect_breakout(data, symbol)
                 if result['is_breakout']:
@@ -301,13 +338,14 @@ async def scan_stocks(
                         timestamp=datetime.now().isoformat()
                     ))
             except Exception as e:
-                # Skip stocks that fail
+                failed_stocks.append(symbol)
                 continue
         
         return {
             "total_scanned": len(stock_list),
             "breakout_stocks": results,
             "breakout_count": len(results),
+            "failed_stocks": failed_stocks,
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
