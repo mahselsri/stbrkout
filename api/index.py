@@ -7,7 +7,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
-import requests
 import json
 
 app = FastAPI(title="Stock Breakout API", version="1.0.0")
@@ -43,9 +42,9 @@ class BreakoutResponse(BaseModel):
     volume_confirmation: bool
     timestamp: str
 
-# --- Stock Data Fetcher (Fixed) ---
+# --- Stock Data Fetcher (Compatible with all yfinance versions) ---
 def fetch_stock_data(symbol: str, period: str = '3mo'):
-    """Fetch stock data from Yahoo Finance - Fixed version"""
+    """Fetch stock data from Yahoo Finance - Compatible version"""
     
     # Clean symbol
     symbol = symbol.strip().upper()
@@ -63,37 +62,57 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
             # Create ticker
             ticker = yf.Ticker(try_symbol)
             
-            # Get historical data directly - don't use set_session
-            data = ticker.history(period=period, progress=False)
+            # Try different methods to get data (without progress parameter)
+            try:
+                # Method 1: Try with period only
+                data = ticker.history(period=period)
+            except TypeError:
+                try:
+                    # Method 2: Try without any parameters
+                    data = ticker.history()
+                except:
+                    try:
+                        # Method 3: Try with start and end dates
+                        end_date = datetime.now()
+                        start_date = end_date - pd.Timedelta(days=90)  # 3 months
+                        data = ticker.history(start=start_date.strftime('%Y-%m-%d'), 
+                                             end=end_date.strftime('%Y-%m-%d'))
+                    except:
+                        data = pd.DataFrame()
             
             # If data is empty, try a shorter period
             if data.empty:
                 print(f"No data for {try_symbol}, trying 1mo...")
-                data = ticker.history(period='1mo', progress=False)
+                try:
+                    data = ticker.history(period='1mo')
+                except:
+                    data = ticker.history()
             
             if not data.empty:
-                print(f"Successfully fetched data for {try_symbol}")
+                print(f"Successfully fetched {len(data)} rows for {try_symbol}")
                 return data
             
             # If still empty, try to get info
-            info = ticker.info
-            if info and 'regularMarketPrice' in info:
-                print(f"Using info data for {try_symbol}")
-                # Create minimal dataframe from info
-                current_price = info.get('regularMarketPrice', 0)
-                previous_close = info.get('previousClose', current_price)
-                
-                # Create a single row dataframe with today's data
-                data = pd.DataFrame({
-                    'Open': [info.get('regularMarketOpen', current_price)],
-                    'High': [info.get('regularMarketDayHigh', current_price)],
-                    'Low': [info.get('regularMarketDayLow', current_price)],
-                    'Close': [current_price],
-                    'Volume': [info.get('regularMarketVolume', 0)]
-                }, index=[pd.Timestamp.now()])
-                
-                if current_price > 0:
-                    return data
+            try:
+                info = ticker.info
+                if info and 'regularMarketPrice' in info:
+                    print(f"Using info data for {try_symbol}")
+                    current_price = info.get('regularMarketPrice', 0)
+                    previous_close = info.get('previousClose', current_price)
+                    
+                    # Create a single row dataframe
+                    data = pd.DataFrame({
+                        'Open': [info.get('regularMarketOpen', current_price)],
+                        'High': [info.get('regularMarketDayHigh', current_price)],
+                        'Low': [info.get('regularMarketDayLow', current_price)],
+                        'Close': [current_price],
+                        'Volume': [info.get('regularMarketVolume', 0)]
+                    }, index=[pd.Timestamp.now()])
+                    
+                    if current_price > 0:
+                        return data
+            except:
+                pass
                 
         except Exception as e:
             print(f"Error with {try_symbol}: {str(e)}")
@@ -104,17 +123,6 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
         status_code=404, 
         detail=f"No data found for {symbol}. Please check the symbol. Try using format like 'RELIANCE.NS' or 'TCS.BO'"
     )
-
-def fetch_stock_data_with_retry(symbol: str, period: str = '3mo', max_retries: int = 2):
-    """Fetch with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            return fetch_stock_data(symbol, period)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep(1)
-    raise HTTPException(status_code=404, detail=f"Failed to fetch data for {symbol}")
 
 # --- Analysis Functions ---
 def calculate_pivot_points(data):
@@ -144,6 +152,7 @@ def calculate_pivot_points(data):
             'r3': round(r3, 2)
         }
     except Exception as e:
+        print(f"Pivot calculation error: {e}")
         return {'pivot': 0, 'r1': 0, 'r2': 0, 'r3': 0}
 
 def calculate_dynamic_resistance(data, lookback=14):
@@ -151,15 +160,24 @@ def calculate_dynamic_resistance(data, lookback=14):
     try:
         if len(data) < lookback:
             lookback = max(len(data) // 2, 5)
+        
+        # Ensure we have enough data
+        if len(data) < 3:
+            return {'r1': 0, 'r2': 0, 'r3': 0}
             
         rolling_high = data['High'].rolling(window=lookback).max()
         rolling_mean = data['High'].rolling(window=lookback).mean()
         rolling_std = data['High'].rolling(window=lookback).std()
         
+        # Get last valid values
+        r1 = float(rolling_mean.iloc[-1] + rolling_std.iloc[-1]) if not pd.isna(rolling_mean.iloc[-1]) else 0
+        r2 = float(rolling_mean.iloc[-1] + 1.5 * rolling_std.iloc[-1]) if not pd.isna(rolling_mean.iloc[-1]) else 0
+        r3 = float(rolling_mean.iloc[-1] + 2 * rolling_std.iloc[-1]) if not pd.isna(rolling_mean.iloc[-1]) else 0
+        
         return {
-            'r1': round(float(rolling_mean.iloc[-1] + rolling_std.iloc[-1]), 2),
-            'r2': round(float(rolling_mean.iloc[-1] + 1.5 * rolling_std.iloc[-1]), 2),
-            'r3': round(float(rolling_mean.iloc[-1] + 2 * rolling_std.iloc[-1]), 2)
+            'r1': round(r1, 2),
+            'r2': round(r2, 2),
+            'r3': round(r3, 2)
         }
     except:
         return {'r1': 0, 'r2': 0, 'r3': 0}
@@ -167,6 +185,9 @@ def calculate_dynamic_resistance(data, lookback=14):
 def detect_breakout(data, symbol):
     """Detect breakout patterns"""
     try:
+        if data.empty:
+            raise ValueError("No data available")
+            
         pivot_levels = calculate_pivot_points(data)
         dynamic_levels = calculate_dynamic_resistance(data)
         
@@ -181,32 +202,35 @@ def detect_breakout(data, symbol):
         current_price = round(float(data['Close'].iloc[-1]), 2)
         previous_close = round(float(data['Close'].iloc[-2]), 2) if len(data) > 1 else current_price
         
-        # Volume confirmation (adjusted for 3mo data)
+        # Volume confirmation
         if len(data) >= 14:
-            avg_volume = float(data['Volume'].rolling(window=14).mean().iloc[-1])
-            current_volume = float(data['Volume'].iloc[-1])
-            volume_confirmation = current_volume > avg_volume * 1.5 if avg_volume > 0 else False
+            try:
+                avg_volume = float(data['Volume'].rolling(window=14).mean().iloc[-1])
+                current_volume = float(data['Volume'].iloc[-1])
+                volume_confirmation = current_volume > avg_volume * 1.5 if avg_volume > 0 else False
+            except:
+                volume_confirmation = False
         else:
             volume_confirmation = False
         
         # Check breakouts
         breakouts = []
         
-        if current_price > resistance['r1'] and resistance['r1'] > 0:
+        if resistance['r1'] > 0 and current_price > resistance['r1']:
             breakouts.append({
                 'level': 'R1',
                 'value': resistance['r1'],
                 'breakout_percent': round(((current_price - resistance['r1']) / resistance['r1']) * 100, 2)
             })
         
-        if current_price > resistance['r2'] and resistance['r2'] > 0:
+        if resistance['r2'] > 0 and current_price > resistance['r2']:
             breakouts.append({
                 'level': 'R2',
                 'value': resistance['r2'],
                 'breakout_percent': round(((current_price - resistance['r2']) / resistance['r2']) * 100, 2)
             })
         
-        if current_price > resistance['r3'] and resistance['r3'] > 0:
+        if resistance['r3'] > 0 and current_price > resistance['r3']:
             breakouts.append({
                 'level': 'R3',
                 'value': resistance['r3'],
@@ -233,11 +257,11 @@ async def root():
         "message": "Stock Breakout Detection API",
         "version": "1.0.0",
         "status": "running",
-        "data_period": "3 months (optimized for performance)",
+        "data_period": "3 months (optimized)",
         "endpoints": {
             "/popular": "Get popular Indian stocks",
-            "/analyze/{symbol}": "Analyze a single stock (3mo data)",
-            "/scan": "Scan multiple stocks (3mo data)",
+            "/analyze/{symbol}": "Analyze a single stock",
+            "/scan": "Scan multiple stocks",
             "/health": "Health check",
             "/test": "Test stock availability"
         },
@@ -305,7 +329,7 @@ async def analyze_stock(
     symbol: str,
     period: str = Query('3mo', description='Data period: 1d,5d,1mo,3mo,6mo,1y')
 ):
-    """Analyze a single stock for breakout patterns using 3 months data"""
+    """Analyze a single stock for breakout patterns"""
     try:
         # Clean symbol
         symbol = symbol.strip().upper()
@@ -314,7 +338,7 @@ async def analyze_stock(
         if '.' not in symbol:
             symbol = symbol + '.NS'
         
-        # Fetch data (using 3mo by default)
+        # Fetch data
         data = fetch_stock_data(symbol, period)
         result = detect_breakout(data, symbol)
         
@@ -341,17 +365,17 @@ async def analyze_stock(
 @app.get("/scan")
 async def scan_stocks(
     symbols: str = Query(
-        'RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS,SBIN.NS',
+        'RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS',
         description='Comma-separated list of stock symbols'
     )
 ):
-    """Scan multiple stocks for breakouts using 3 months data"""
+    """Scan multiple stocks for breakouts"""
     try:
         stock_list = [s.strip().upper() for s in symbols.split(',')]
         # Add .NS if needed
         stock_list = [s if '.' in s else s + '.NS' for s in stock_list]
-        # Limit to 6 stocks for performance
-        stock_list = stock_list[:6]
+        # Limit to 5 stocks for performance
+        stock_list = stock_list[:5]
         
         results = []
         failed_stocks = []
