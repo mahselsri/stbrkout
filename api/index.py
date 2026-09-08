@@ -1,14 +1,28 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import sys
+import os
 from datetime import datetime
+from typing import List, Optional, Dict, Any
 import json
 
-app = FastAPI(title="Stock Breakout API")
+# Fix for distutils issue
+try:
+    from fastapi import FastAPI, HTTPException, Query
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+    import yfinance as yf
+    import pandas as pd
+    import numpy as np
+except ImportError as e:
+    print(f"Import error: {e}")
+    # Fallback
+    from fastapi import FastAPI, HTTPException, Query
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+    import yfinance as yf
+    import pandas as pd
+    import numpy as np
+
+app = FastAPI(title="Stock Breakout API", version="1.0.0")
 
 # Enable CORS
 app.add_middleware(
@@ -78,10 +92,34 @@ def calculate_pivot_points(data):
     except Exception as e:
         return {'pivot': 0, 'r1': 0, 'r2': 0, 'r3': 0}
 
+def calculate_dynamic_resistance(data, lookback=20):
+    """Calculate dynamic resistance using moving averages"""
+    try:
+        rolling_high = data['High'].rolling(window=lookback).max()
+        rolling_mean = data['High'].rolling(window=lookback).mean()
+        rolling_std = data['High'].rolling(window=lookback).std()
+        
+        return {
+            'r1': round(float(rolling_mean.iloc[-1] + rolling_std.iloc[-1]), 2),
+            'r2': round(float(rolling_mean.iloc[-1] + 1.5 * rolling_std.iloc[-1]), 2),
+            'r3': round(float(rolling_mean.iloc[-1] + 2 * rolling_std.iloc[-1]), 2)
+        }
+    except:
+        return {'r1': 0, 'r2': 0, 'r3': 0}
+
 def detect_breakout(data, symbol):
     """Detect breakout patterns"""
     try:
         pivot_levels = calculate_pivot_points(data)
+        dynamic_levels = calculate_dynamic_resistance(data)
+        
+        # Use max of pivot and dynamic resistance
+        resistance = {
+            'pivot': pivot_levels['pivot'],
+            'r1': max(pivot_levels['r1'], dynamic_levels['r1']),
+            'r2': max(pivot_levels['r2'], dynamic_levels['r2']),
+            'r3': max(pivot_levels['r3'], dynamic_levels['r3'])
+        }
         
         current_price = round(float(data['Close'].iloc[-1]), 2)
         previous_close = round(float(data['Close'].iloc[-2]), 2)
@@ -94,32 +132,32 @@ def detect_breakout(data, symbol):
         # Check breakouts
         breakouts = []
         
-        if current_price > pivot_levels['r1']:
+        if current_price > resistance['r1']:
             breakouts.append({
                 'level': 'R1',
-                'value': pivot_levels['r1'],
-                'breakout_percent': round(((current_price - pivot_levels['r1']) / pivot_levels['r1']) * 100, 2)
+                'value': resistance['r1'],
+                'breakout_percent': round(((current_price - resistance['r1']) / resistance['r1']) * 100, 2)
             })
         
-        if current_price > pivot_levels['r2']:
+        if current_price > resistance['r2']:
             breakouts.append({
                 'level': 'R2',
-                'value': pivot_levels['r2'],
-                'breakout_percent': round(((current_price - pivot_levels['r2']) / pivot_levels['r2']) * 100, 2)
+                'value': resistance['r2'],
+                'breakout_percent': round(((current_price - resistance['r2']) / resistance['r2']) * 100, 2)
             })
         
-        if current_price > pivot_levels['r3']:
+        if current_price > resistance['r3']:
             breakouts.append({
                 'level': 'R3',
-                'value': pivot_levels['r3'],
-                'breakout_percent': round(((current_price - pivot_levels['r3']) / pivot_levels['r3']) * 100, 2)
+                'value': resistance['r3'],
+                'breakout_percent': round(((current_price - resistance['r3']) / resistance['r3']) * 100, 2)
             })
         
         return {
             'symbol': symbol,
             'current_price': current_price,
             'previous_close': previous_close,
-            'resistance_levels': pivot_levels,
+            'resistance_levels': resistance,
             'breakouts': breakouts,
             'is_breakout': len(breakouts) > 0,
             'volume_confirmation': volume_confirmation
@@ -135,6 +173,7 @@ async def root():
     return {
         "message": "Stock Breakout Detection API",
         "version": "1.0.0",
+        "status": "running",
         "endpoints": {
             "/popular": "Get popular Indian stocks",
             "/analyze/{symbol}": "Analyze a single stock",
@@ -175,7 +214,12 @@ async def get_popular_indian_stocks():
         {"symbol": "LT.NS", "name": "Larsen & Toubro", "sector": "Construction"},
         {"symbol": "HINDUNILVR.NS", "name": "Hindustan Unilever", "sector": "FMCG"},
         {"symbol": "SUNPHARMA.NS", "name": "Sun Pharma", "sector": "Pharma"},
-        {"symbol": "BAJFINANCE.NS", "name": "Bajaj Finance", "sector": "Finance"}
+        {"symbol": "BAJFINANCE.NS", "name": "Bajaj Finance", "sector": "Finance"},
+        {"symbol": "ADANIENT.NS", "name": "Adani Enterprises", "sector": "Conglomerate"},
+        {"symbol": "HDFC.NS", "name": "HDFC Ltd", "sector": "Finance"},
+        {"symbol": "NTPC.NS", "name": "NTPC", "sector": "Energy"},
+        {"symbol": "POWERGRID.NS", "name": "Power Grid", "sector": "Energy"},
+        {"symbol": "M&M.NS", "name": "Mahindra & Mahindra", "sector": "Automobile"}
     ]
     return {
         "stocks": stocks,
@@ -183,7 +227,7 @@ async def get_popular_indian_stocks():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.get("/analyze/{symbol}", response_model=BreakoutResponse)
+@app.get("/analyze/{symbol}")
 async def analyze_stock(
     symbol: str,
     period: str = Query('6mo', description='Data period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,max')
@@ -232,8 +276,11 @@ async def scan_stocks(
         # Ensure .NS suffix
         stock_list = [s if s.endswith('.NS') else s + '.NS' for s in stock_list]
         
+        # Limit to 10 stocks for performance
+        stock_list = stock_list[:10]
+        
         results = []
-        for symbol in stock_list[:10]:  # Limit to 10 stocks for performance
+        for symbol in stock_list:
             try:
                 data = fetch_stock_data(symbol, '3mo')
                 result = detect_breakout(data, symbol)
@@ -266,5 +313,5 @@ async def scan_stocks(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# For Vercel - this is critical
+# For Vercel
 app = app

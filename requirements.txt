@@ -1,7 +1,7 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-yfinance==0.2.33
-pandas==1.5.3
-numpy==1.24.3
-python-dotenv==1.0.0
-pydantic==2.5.0
+fastapi==0.110.0
+uvicorn==0.29.0
+yfinance==0.2.38
+pandas==2.2.1
+numpy==1.26.4
+pydantic==2.6.1
+python-dotenv==1.0.1
