@@ -1,16 +1,15 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
 
-app = FastAPI(title="Stock Breakout API", version="1.0.0")
+app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Models ---
 class ResistanceLevels(BaseModel):
     pivot: float
     r1: float
@@ -41,7 +39,6 @@ class BreakoutResponse(BaseModel):
     volume_confirmation: bool
     timestamp: str
 
-# --- Simple Cache ---
 cache = {}
 cache_expiry = {}
 
@@ -55,17 +52,12 @@ def set_in_cache(key, data, ttl=300):
     cache[key] = data
     cache_expiry[key] = datetime.now() + timedelta(seconds=ttl)
 
-# --- Stock Data Fetcher ---
 def fetch_stock_data(symbol: str, period: str = '3mo'):
-    """Fetch stock data with caching"""
-    
-    # Check cache
     cache_key = f"{symbol}_{period}"
     cached = get_from_cache(cache_key)
     if cached is not None:
         return cached
     
-    # Clean symbol
     symbol = symbol.strip().upper()
     if '.' not in symbol:
         symbols_to_try = [f"{symbol}.NS", f"{symbol}.BO"]
@@ -74,21 +66,15 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
     
     for try_symbol in symbols_to_try:
         try:
-            # Add delay to avoid rate limiting
             time.sleep(0.3)
-            
             ticker = yf.Ticker(try_symbol)
             
-            # Try different methods
             data = None
-            
-            # Method 1: With period
             try:
                 data = ticker.history(period=period)
             except:
                 pass
             
-            # Method 2: With dates
             if data is None or data.empty:
                 try:
                     end_date = datetime.now()
@@ -100,59 +86,30 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
                 except:
                     pass
             
-            # Method 3: Try shorter period
             if data is None or data.empty:
                 try:
                     data = ticker.history(period='1mo')
                 except:
                     pass
             
-            # Method 4: Get info only
-            if data is None or data.empty:
-                try:
-                    info = ticker.info
-                    if info and 'regularMarketPrice' in info:
-                        current_price = info.get('regularMarketPrice', 0)
-                        data = pd.DataFrame({
-                            'Open': [info.get('regularMarketOpen', current_price)],
-                            'High': [info.get('regularMarketDayHigh', current_price)],
-                            'Low': [info.get('regularMarketDayLow', current_price)],
-                            'Close': [current_price],
-                            'Volume': [info.get('regularMarketVolume', 0)]
-                        }, index=[pd.Timestamp.now()])
-                except:
-                    pass
-            
             if data is not None and not data.empty:
                 set_in_cache(cache_key, data)
                 return data
-                
-        except Exception as e:
-            print(f"Error with {try_symbol}: {str(e)}")
+        except:
             continue
     
-    # If all fail, try mock data
+    # Fallback mock data
     return generate_mock_data(symbol)
 
-def generate_mock_data(symbol: str):
-    """Generate mock data when API fails"""
-    print(f"Generating mock data for {symbol}")
-    
+def generate_mock_data(symbol):
     end_date = datetime.now()
     dates = pd.date_range(end=end_date, periods=60, freq='D')
     
-    # Base prices for different stocks
     base_prices = {
-        'RELIANCE': 2450,
-        'TCS': 4200,
-        'INFY': 1800,
-        'HDFCBANK': 1600,
-        'ICICIBANK': 1100,
-        'SBIN': 800,
-        'BHARTIARTL': 1200,
-        'ITC': 450,
+        'RELIANCE': 2450, 'TCS': 4200, 'INFY': 1800,
+        'HDFCBANK': 1600, 'ICICIBANK': 1100, 'SBIN': 800,
+        'BHARTIARTL': 1200, 'ITC': 450
     }
-    
     base_price = 1000
     for key, price in base_prices.items():
         if key in symbol:
@@ -171,7 +128,6 @@ def generate_mock_data(symbol: str):
         'Volume': np.random.randint(100000, 1000000, 60)
     }
     
-    # Ensure High is highest, Low is lowest
     for i in range(60):
         data['High'][i] = max(data['Open'][i], data['High'][i], data['Close'][i])
         data['Low'][i] = min(data['Open'][i], data['Low'][i], data['Close'][i])
@@ -180,7 +136,6 @@ def generate_mock_data(symbol: str):
     set_in_cache(f"{symbol}_3mo", df, ttl=600)
     return df
 
-# --- Analysis Functions ---
 def calculate_pivot_points(data):
     try:
         if len(data) < 2:
@@ -212,10 +167,9 @@ def calculate_dynamic_resistance(data, lookback=14):
     try:
         if len(data) < lookback:
             lookback = max(len(data) // 2, 5)
-        
         if len(data) < 3:
             return {'r1': 0, 'r2': 0, 'r3': 0}
-            
+        
         rolling_mean = data['Close'].rolling(window=lookback).mean()
         rolling_std = data['Close'].rolling(window=lookback).std()
         
@@ -223,11 +177,7 @@ def calculate_dynamic_resistance(data, lookback=14):
         r2 = float(rolling_mean.iloc[-1] + 1.5 * rolling_std.iloc[-1]) if not pd.isna(rolling_mean.iloc[-1]) else 0
         r3 = float(rolling_mean.iloc[-1] + 2 * rolling_std.iloc[-1]) if not pd.isna(rolling_mean.iloc[-1]) else 0
         
-        return {
-            'r1': round(r1, 2),
-            'r2': round(r2, 2),
-            'r3': round(r3, 2)
-        }
+        return {'r1': round(r1, 2), 'r2': round(r2, 2), 'r3': round(r3, 2)}
     except:
         return {'r1': 0, 'r2': 0, 'r3': 0}
 
@@ -249,7 +199,6 @@ def detect_breakout(data, symbol):
         current_price = round(float(data['Close'].iloc[-1]), 2)
         previous_close = round(float(data['Close'].iloc[-2]), 2) if len(data) > 1 else current_price
         
-        # Volume confirmation
         volume_confirmation = False
         if len(data) >= 14:
             try:
@@ -260,21 +209,18 @@ def detect_breakout(data, symbol):
                 pass
         
         breakouts = []
-        
         if resistance['r1'] > 0 and current_price > resistance['r1']:
             breakouts.append({
                 'level': 'R1',
                 'value': resistance['r1'],
                 'breakout_percent': round(((current_price - resistance['r1']) / resistance['r1']) * 100, 2)
             })
-        
         if resistance['r2'] > 0 and current_price > resistance['r2']:
             breakouts.append({
                 'level': 'R2',
                 'value': resistance['r2'],
                 'breakout_percent': round(((current_price - resistance['r2']) / resistance['r2']) * 100, 2)
             })
-        
         if resistance['r3'] > 0 and current_price > resistance['r3']:
             breakouts.append({
                 'level': 'R3',
@@ -294,50 +240,36 @@ def detect_breakout(data, symbol):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
-# --- API Endpoints ---
-
 @app.get("/")
 async def root():
     return {
         "message": "Stock Breakout Detection API",
-        "version": "1.0.0",
         "status": "running",
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "cache_size": len(cache),
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"status": "healthy", "cache_size": len(cache), "timestamp": datetime.now().isoformat()}
 
 @app.get("/popular")
 async def get_popular_indian_stocks():
     stocks = [
-        {"symbol": "RELIANCE.NS", "name": "Reliance Industries", "sector": "Oil & Gas"},
-        {"symbol": "TCS.NS", "name": "Tata Consultancy Services", "sector": "IT"},
-        {"symbol": "INFY.NS", "name": "Infosys", "sector": "IT"},
-        {"symbol": "HDFCBANK.NS", "name": "HDFC Bank", "sector": "Banking"},
-        {"symbol": "ICICIBANK.NS", "name": "ICICI Bank", "sector": "Banking"},
-        {"symbol": "SBIN.NS", "name": "State Bank of India", "sector": "Banking"},
-        {"symbol": "BHARTIARTL.NS", "name": "Bharti Airtel", "sector": "Telecom"},
-        {"symbol": "ITC.NS", "name": "ITC Ltd", "sector": "FMCG"},
-        {"symbol": "WIPRO.NS", "name": "Wipro", "sector": "IT"},
-        {"symbol": "HCLTECH.NS", "name": "HCL Technologies", "sector": "IT"}
+        {"symbol": "RELIANCE.NS", "name": "Reliance Industries"},
+        {"symbol": "TCS.NS", "name": "Tata Consultancy Services"},
+        {"symbol": "INFY.NS", "name": "Infosys"},
+        {"symbol": "HDFCBANK.NS", "name": "HDFC Bank"},
+        {"symbol": "ICICIBANK.NS", "name": "ICICI Bank"},
+        {"symbol": "SBIN.NS", "name": "State Bank of India"},
+        {"symbol": "BHARTIARTL.NS", "name": "Bharti Airtel"},
+        {"symbol": "ITC.NS", "name": "ITC Ltd"},
+        {"symbol": "WIPRO.NS", "name": "Wipro"},
+        {"symbol": "HCLTECH.NS", "name": "HCL Technologies"}
     ]
-    return {
-        "stocks": stocks,
-        "total": len(stocks),
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"stocks": stocks, "total": len(stocks), "timestamp": datetime.now().isoformat()}
 
 @app.get("/analyze/{symbol}")
-async def analyze_stock(
-    symbol: str,
-    period: str = Query('3mo', description='Data period: 1d,5d,1mo,3mo,6mo,1y')
-):
+async def analyze_stock(symbol: str, period: str = Query('3mo')):
     try:
         symbol = symbol.strip().upper()
         if '.' not in symbol:
@@ -367,9 +299,7 @@ async def analyze_stock(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/scan")
-async def scan_stocks(
-    symbols: str = Query('RELIANCE.NS,TCS.NS,INFY.NS')
-):
+async def scan_stocks(symbols: str = Query('RELIANCE.NS,TCS.NS,INFY.NS')):
     try:
         stock_list = [s.strip().upper() for s in symbols.split(',')]
         stock_list = [s if '.' in s else s + '.NS' for s in stock_list]
@@ -398,7 +328,7 @@ async def scan_stocks(
                         volume_confirmation=result['volume_confirmation'],
                         timestamp=datetime.now().isoformat()
                     ))
-            except Exception as e:
+            except:
                 failed_stocks.append(symbol)
                 continue
         
@@ -418,5 +348,4 @@ async def clear_cache():
     cache_expiry.clear()
     return {"message": "Cache cleared", "timestamp": datetime.now().isoformat()}
 
-# For Vercel
 app = app
