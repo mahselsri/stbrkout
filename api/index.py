@@ -1,12 +1,14 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
+import requests
+import os
 
 app = FastAPI()
 
@@ -38,6 +40,7 @@ class BreakoutResponse(BaseModel):
     is_breakout: bool
     volume_confirmation: bool
     timestamp: str
+    data_source: str = "unknown"
 
 cache = {}
 cache_expiry = {}
@@ -52,7 +55,210 @@ def set_in_cache(key, data, ttl=300):
     cache[key] = data
     cache_expiry[key] = datetime.now() + timedelta(seconds=ttl)
 
+# --- Data Source 1: Yahoo Finance ---
+def fetch_from_yahoo(symbol: str, period: str = '3mo'):
+    """Fetch from Yahoo Finance with price validation"""
+    try:
+        print(f"Yahoo Finance: {symbol}")
+        
+        # Add delay
+        time.sleep(0.3)
+        
+        ticker = yf.Ticker(symbol)
+        
+        # Get info first to check price
+        info = ticker.info
+        if info:
+            currency = info.get('currency', '')
+            market = info.get('market', '')
+            print(f"  Currency: {currency}, Market: {market}")
+        
+        # Try to get history
+        data = None
+        try:
+            data = ticker.history(period=period)
+        except:
+            pass
+        
+        if data is None or data.empty:
+            try:
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=90)
+                data = ticker.history(
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d')
+                )
+            except:
+                pass
+        
+        if data is None or data.empty:
+            try:
+                data = ticker.history(period='1mo')
+            except:
+                pass
+        
+        if data is not None and not data.empty:
+            # Check if price is in INR (should be < 50000 for Indian stocks)
+            latest_price = float(data['Close'].iloc[-1])
+            
+            # If price seems like USD (too high for INR), try to get from info
+            if latest_price > 10000 and 'NS' in symbol:
+                print(f"  Price {latest_price} seems high, checking info...")
+                if info and 'regularMarketPrice' in info:
+                    real_price = info.get('regularMarketPrice', 0)
+                    if 100 < real_price < 10000:
+                        print(f"  Using info price: ₹{real_price}")
+                        # Create dataframe with correct price
+                        data = pd.DataFrame({
+                            'Open': [info.get('regularMarketOpen', real_price)],
+                            'High': [info.get('regularMarketDayHigh', real_price)],
+                            'Low': [info.get('regularMarketDayLow', real_price)],
+                            'Close': [real_price],
+                            'Volume': [info.get('regularMarketVolume', 0)]
+                        }, index=[pd.Timestamp.now()])
+            
+            print(f"  Yahoo success: {len(data)} rows, latest: ₹{data['Close'].iloc[-1]}")
+            return data, 'yahoo'
+        
+        return None, None
+        
+    except Exception as e:
+        print(f"  Yahoo error: {str(e)}")
+        return None, None
+
+# --- Data Source 2: Alpha Vantage ---
+def fetch_from_alphavantage(symbol: str):
+    """Fetch from Alpha Vantage with INR conversion"""
+    try:
+        api_key = os.environ.get('ALPHA_VANTAGE_KEY', 'demo')
+        if api_key == 'demo':
+            print("  Alpha Vantage: No API key")
+            return None, None
+            
+        print(f"Alpha Vantage: {symbol}")
+        
+        # Clean symbol for Alpha Vantage
+        av_symbol = symbol.replace('.NS', '').replace('.BO', '')
+        
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "TIME_SERIES_DAILY",
+            "symbol": av_symbol,
+            "apikey": api_key,
+            "outputsize": "compact"
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if "Time Series (Daily)" in data:
+            time_series = data["Time Series (Daily)"]
+            
+            df_data = []
+            for date, values in list(time_series.items())[:90]:
+                close = float(values['4. close'])
+                
+                # Alpha Vantage returns USD for Indian stocks
+                # Convert to INR (approximate rate ~83 INR/USD)
+                # Check if price seems like USD (should be < 1000)
+                if close < 1000:
+                    close_inr = close * 83  # Convert to INR
+                    print(f"  Converted USD ${close} to ₹{close_inr}")
+                else:
+                    close_inr = close  # Already in INR
+                
+                df_data.append({
+                    'Date': pd.to_datetime(date),
+                    'Open': float(values['1. open']) * 83 if float(values['1. open']) < 1000 else float(values['1. open']),
+                    'High': float(values['2. high']) * 83 if float(values['2. high']) < 1000 else float(values['2. high']),
+                    'Low': float(values['3. low']) * 83 if float(values['3. low']) < 1000 else float(values['3. low']),
+                    'Close': close_inr,
+                    'Volume': float(values['5. volume'])
+                })
+            
+            df = pd.DataFrame(df_data)
+            df.set_index('Date', inplace=True)
+            df.sort_index(inplace=True)
+            
+            print(f"  Alpha Vantage success: {len(df)} rows")
+            return df, 'alphavantage'
+            
+        elif "Note" in data:
+            print(f"  Alpha Vantage rate limit: {data['Note']}")
+            return None, None
+        else:
+            print(f"  Alpha Vantage error: {data}")
+            return None, None
+            
+    except Exception as e:
+        print(f"  Alpha Vantage error: {str(e)}")
+        return None, None
+
+# --- Data Source 3: Twelve Data ---
+def fetch_from_twelvedata(symbol: str):
+    """Fetch from Twelve Data with INR conversion"""
+    try:
+        api_key = os.environ.get('TWELVE_DATA_KEY', '')
+        if not api_key:
+            print("  Twelve Data: No API key")
+            return None, None
+            
+        print(f"Twelve Data: {symbol}")
+        
+        td_symbol = symbol.replace('.NS', '').replace('.BO', '')
+        
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": f"NSE:{td_symbol}",
+            "interval": "1day",
+            "outputsize": "90",
+            "apikey": api_key
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if "values" in data and data["values"]:
+            values = data["values"]
+            
+            df_data = []
+            for item in values[:90]:
+                close = float(item['close'])
+                
+                # Check if price seems like USD (should be < 1000 for Indian stocks in USD)
+                if close < 1000:
+                    close_inr = close * 83  # Convert to INR
+                else:
+                    close_inr = close
+                
+                df_data.append({
+                    'Date': pd.to_datetime(item['datetime']),
+                    'Open': float(item['open']) * 83 if float(item['open']) < 1000 else float(item['open']),
+                    'High': float(item['high']) * 83 if float(item['high']) < 1000 else float(item['high']),
+                    'Low': float(item['low']) * 83 if float(item['low']) < 1000 else float(item['low']),
+                    'Close': close_inr,
+                    'Volume': float(item['volume'])
+                })
+            
+            df = pd.DataFrame(df_data)
+            df.set_index('Date', inplace=True)
+            df.sort_index(inplace=True)
+            
+            print(f"  Twelve Data success: {len(df)} rows")
+            return df, 'twelvedata'
+            
+        else:
+            print(f"  Twelve Data error: {data.get('status', 'unknown')}")
+            return None, None
+            
+    except Exception as e:
+        print(f"  Twelve Data error: {str(e)}")
+        return None, None
+
+# --- Main Fetch Function ---
 def fetch_stock_data(symbol: str, period: str = '3mo'):
+    """Fetch stock data from multiple sources with price validation"""
+    
     cache_key = f"{symbol}_{period}"
     cached = get_from_cache(cache_key)
     if cached is not None:
@@ -65,76 +271,34 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
         symbols_to_try = [symbol]
     
     for try_symbol in symbols_to_try:
-        try:
-            time.sleep(0.3)
-            ticker = yf.Ticker(try_symbol)
-            
-            data = None
-            try:
-                data = ticker.history(period=period)
-            except:
-                pass
-            
-            if data is None or data.empty:
-                try:
-                    end_date = datetime.now()
-                    start_date = end_date - timedelta(days=90)
-                    data = ticker.history(
-                        start=start_date.strftime('%Y-%m-%d'),
-                        end=end_date.strftime('%Y-%m-%d')
-                    )
-                except:
-                    pass
-            
-            if data is None or data.empty:
-                try:
-                    data = ticker.history(period='1mo')
-                except:
-                    pass
-            
-            if data is not None and not data.empty:
-                set_in_cache(cache_key, data)
-                return data
-        except:
-            continue
+        print(f"\nTrying: {try_symbol}")
+        
+        # Try Yahoo Finance
+        data, source = fetch_from_yahoo(try_symbol, period)
+        if data is not None and not data.empty:
+            print(f"✓ Using {source}")
+            set_in_cache(cache_key, data)
+            return data
+        
+        # Try Alpha Vantage
+        data, source = fetch_from_alphavantage(try_symbol)
+        if data is not None and not data.empty:
+            print(f"✓ Using {source}")
+            set_in_cache(cache_key, data)
+            return data
+        
+        # Try Twelve Data
+        data, source = fetch_from_twelvedata(try_symbol)
+        if data is not None and not data.empty:
+            print(f"✓ Using {source}")
+            set_in_cache(cache_key, data)
+            return data
     
-    # Fallback mock data
-    return generate_mock_data(symbol)
-
-def generate_mock_data(symbol):
-    end_date = datetime.now()
-    dates = pd.date_range(end=end_date, periods=60, freq='D')
-    
-    base_prices = {
-        'RELIANCE': 2450, 'TCS': 4200, 'INFY': 1800,
-        'HDFCBANK': 1600, 'ICICIBANK': 1100, 'SBIN': 800,
-        'BHARTIARTL': 1200, 'ITC': 450
-    }
-    base_price = 1000
-    for key, price in base_prices.items():
-        if key in symbol:
-            base_price = price
-            break
-    
-    np.random.seed(hash(symbol) % 2**32)
-    returns = np.random.normal(0.0005, 0.015, 60)
-    prices = base_price * np.exp(np.cumsum(returns))
-    
-    data = {
-        'Open': prices * (1 + np.random.normal(0, 0.002, 60)),
-        'High': prices * (1 + np.random.normal(0.005, 0.005, 60)),
-        'Low': prices * (1 - np.random.normal(0.005, 0.005, 60)),
-        'Close': prices,
-        'Volume': np.random.randint(100000, 1000000, 60)
-    }
-    
-    for i in range(60):
-        data['High'][i] = max(data['Open'][i], data['High'][i], data['Close'][i])
-        data['Low'][i] = min(data['Open'][i], data['Low'][i], data['Close'][i])
-    
-    df = pd.DataFrame(data, index=dates)
-    set_in_cache(f"{symbol}_3mo", df, ttl=600)
-    return df
+    # If all fail
+    raise HTTPException(
+        status_code=404,
+        detail=f"Could not fetch data for {symbol}. Please try again later."
+    )
 
 def calculate_pivot_points(data):
     try:
@@ -160,7 +324,8 @@ def calculate_pivot_points(data):
             'r2': round(r2, 2),
             'r3': round(r3, 2)
         }
-    except:
+    except Exception as e:
+        print(f"Pivot calculation error: {e}")
         return {'pivot': 0, 'r1': 0, 'r2': 0, 'r3': 0}
 
 def calculate_dynamic_resistance(data, lookback=14):
@@ -178,7 +343,8 @@ def calculate_dynamic_resistance(data, lookback=14):
         r3 = float(rolling_mean.iloc[-1] + 2 * rolling_std.iloc[-1]) if not pd.isna(rolling_mean.iloc[-1]) else 0
         
         return {'r1': round(r1, 2), 'r2': round(r2, 2), 'r3': round(r3, 2)}
-    except:
+    except Exception as e:
+        print(f"Dynamic resistance error: {e}")
         return {'r1': 0, 'r2': 0, 'r3': 0}
 
 def detect_breakout(data, symbol):
@@ -199,6 +365,7 @@ def detect_breakout(data, symbol):
         current_price = round(float(data['Close'].iloc[-1]), 2)
         previous_close = round(float(data['Close'].iloc[-2]), 2) if len(data) > 1 else current_price
         
+        # Volume confirmation
         volume_confirmation = False
         if len(data) >= 14:
             try:
@@ -245,12 +412,68 @@ async def root():
     return {
         "message": "Stock Breakout Detection API",
         "status": "running",
+        "data_sources": ["Yahoo Finance", "Alpha Vantage", "Twelve Data"],
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "cache_size": len(cache), "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy", 
+        "cache_size": len(cache),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/debug/{symbol}")
+async def debug_stock(symbol: str):
+    """Debug endpoint to check data sources"""
+    try:
+        symbol = symbol.strip().upper()
+        if '.' not in symbol:
+            symbol = symbol + '.NS'
+        
+        results = {}
+        
+        # Test Yahoo
+        data, source = fetch_from_yahoo(symbol)
+        if data is not None and not data.empty:
+            results['yahoo'] = {
+                'status': 'success',
+                'latest_price': float(data['Close'].iloc[-1]),
+                'data_points': len(data)
+            }
+        else:
+            results['yahoo'] = {'status': 'failed'}
+        
+        # Test Alpha Vantage
+        data, source = fetch_from_alphavantage(symbol)
+        if data is not None and not data.empty:
+            results['alphavantage'] = {
+                'status': 'success',
+                'latest_price': float(data['Close'].iloc[-1]),
+                'data_points': len(data)
+            }
+        else:
+            results['alphavantage'] = {'status': 'failed'}
+        
+        # Test Twelve Data
+        data, source = fetch_from_twelvedata(symbol)
+        if data is not None and not data.empty:
+            results['twelvedata'] = {
+                'status': 'success',
+                'latest_price': float(data['Close'].iloc[-1]),
+                'data_points': len(data)
+            }
+        else:
+            results['twelvedata'] = {'status': 'failed'}
+        
+        return {
+            "symbol": symbol,
+            "results": results,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/popular")
 async def get_popular_indian_stocks():
@@ -328,8 +551,8 @@ async def scan_stocks(symbols: str = Query('RELIANCE.NS,TCS.NS,INFY.NS')):
                         volume_confirmation=result['volume_confirmation'],
                         timestamp=datetime.now().isoformat()
                     ))
-            except:
-                failed_stocks.append(symbol)
+            except Exception as e:
+                failed_stocks.append(f"{symbol}: {str(e)[:50]}")
                 continue
         
         return {
