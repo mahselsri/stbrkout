@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "description": "Stock Breakout Detection API",
   "scripts": {
-    "build": "pip install -r requirements.txt"
+    "build": "echo 'Building...'"
   },
   "dependencies": {},
   "devDependencies": {},
   "engines": {
-    "node": "18.x"
+    "node": "24.x"
   }
 }
