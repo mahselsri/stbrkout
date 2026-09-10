@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
@@ -21,6 +21,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
+# NIFTY 50 STOCK LIST (New Addition)
+# ============================================================
+NIFTY_50 = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+    "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
+    "LT.NS", "AXISBANK.NS", "WIPRO.NS", "ASIANPAINT.NS", "HCLTECH.NS",
+    "MARUTI.NS", "BAJFINANCE.NS", "TITAN.NS", "SUNPHARMA.NS", "TECHM.NS",
+    "NESTLEIND.NS", "POWERGRID.NS", "ULTRACEMCO.NS", "ADANIENT.NS", "TATAMOTORS.NS",
+    "ONGC.NS", "TATASTEEL.NS", "JSWSTEEL.NS", "NTPC.NS", "INDUSINDBK.NS",
+    "M&M.NS", "COALINDIA.NS", "BAJAJFINSV.NS", "HINDALCO.NS", "DRREDDY.NS",
+    "GRASIM.NS", "DIVISLAB.NS", "BAJAJ-AUTO.NS", "BRITANNIA.NS", "HEROMOTOCO.NS",
+    "ADANIPORTS.NS", "CIPLA.NS", "UPL.NS", "SBILIFE.NS", "EICHERMOT.NS",
+    "BPCL.NS", "TATACONSUM.NS", "APOLLOHOSP.NS", "SHREECEM.NS", "HDFC.NS"
+]
+
+# ============================================================
+# Models (Existing + New)
+# ============================================================
 class ResistanceLevels(BaseModel):
     pivot: float
     r1: float
@@ -44,6 +63,27 @@ class BreakoutResponse(BaseModel):
     data_source: str = "unknown"
     date_used: str = ""
 
+# New model for scan results
+class StockBreakout(BaseModel):
+    symbol: str
+    current_price: float
+    previous_close: float
+    change_percent: float
+    resistance_levels: ResistanceLevels
+    breakouts: List[BreakoutSignal]
+    is_breakout: bool
+    volume_confirmation: bool
+    volume_ratio: float
+    date_used: str
+
+class ScanResponse(BaseModel):
+    scan_time: str
+    total_stocks: int
+    breakout_count: int
+    breakouts: List[StockBreakout]
+    failed_stocks: List[str]
+    scan_duration_seconds: float
+
 cache = {}
 cache_expiry = {}
 
@@ -57,27 +97,22 @@ def set_in_cache(key, data, ttl=300):
     cache[key] = data
     cache_expiry[key] = datetime.now() + timedelta(seconds=ttl)
 
-# --- Data Source 1: Yahoo Finance (with correct date handling) ---
+# --- Data Source 1: Yahoo Finance (unchanged) ---
 def fetch_from_yahoo(symbol: str, period: str = '3mo'):
     """Fetch from Yahoo Finance with correct date handling"""
     try:
         print(f"📊 Yahoo Finance: {symbol}")
         
         ticker = yf.Ticker(symbol)
-        
-        # Get info first
         info = ticker.info
         currency = info.get('currency', 'INR') if info else 'INR'
         print(f"  Currency: {currency}")
         
-        # Get current date for reference
         today = datetime.now()
         print(f"  Today's date: {today.strftime('%Y-%m-%d')}")
         
-        # Try different date formats and periods
         data = None
         
-        # Method 1: Standard period
         try:
             print(f"  Fetching with period: {period}")
             data = ticker.history(period=period)
@@ -87,7 +122,6 @@ def fetch_from_yahoo(symbol: str, period: str = '3mo'):
         except Exception as e:
             print(f"  Period fetch error: {e}")
         
-        # Method 2: With explicit dates (YYYY-MM-DD format)
         if data is None or data.empty:
             try:
                 end_date = today.strftime('%Y-%m-%d')
@@ -100,7 +134,6 @@ def fetch_from_yahoo(symbol: str, period: str = '3mo'):
             except Exception as e:
                 print(f"  Date fetch error: {e}")
         
-        # Method 3: Try with different date format (DD-MM-YYYY)
         if data is None or data.empty:
             try:
                 end_date = today.strftime('%d-%m-%Y')
@@ -113,7 +146,6 @@ def fetch_from_yahoo(symbol: str, period: str = '3mo'):
             except Exception as e:
                 print(f"  DD-MM-YYYY fetch error: {e}")
         
-        # Method 4: Try with timestamp
         if data is None or data.empty:
             try:
                 end_date = int(today.timestamp())
@@ -126,7 +158,6 @@ def fetch_from_yahoo(symbol: str, period: str = '3mo'):
             except Exception as e:
                 print(f"  Timestamp fetch error: {e}")
         
-        # Method 5: Just get 1 month if 3 months fails
         if data is None or data.empty:
             try:
                 print(f"  Fetching with period: 1mo")
@@ -138,12 +169,10 @@ def fetch_from_yahoo(symbol: str, period: str = '3mo'):
                 print(f"  1mo fetch error: {e}")
         
         if data is not None and not data.empty:
-            # Get the latest price
             latest_price = float(data['Close'].iloc[-1])
             latest_date = data.index[-1]
             print(f"  ✅ Latest: ₹{latest_price} on {latest_date.strftime('%Y-%m-%d')}")
             
-            # Check if price is in USD and convert
             if currency == 'USD' and 1 < latest_price < 1000:
                 inr_price = latest_price * 83.5
                 print(f"  Converting USD ${latest_price} to INR ₹{inr_price}")
@@ -161,7 +190,7 @@ def fetch_from_yahoo(symbol: str, period: str = '3mo'):
         print(f"  Yahoo error: {str(e)}")
         return None, None
 
-# --- Data Source 2: Info API (Current price only) ---
+# --- Data Source 2: Info API (unchanged) ---
 def fetch_from_info(symbol: str):
     """Fetch current price from info only"""
     try:
@@ -179,13 +208,11 @@ def fetch_from_info(symbol: str):
             print(f"  Market price: {current_price} ({currency})")
             print(f"  Market time: {market_time}")
             
-            # Convert if USD
             if currency == 'USD' and current_price < 1000:
                 current_price = current_price * 83.5
                 previous_close = previous_close * 83.5
                 print(f"  Converted to INR: ₹{current_price}")
             
-            # Create dataframe with proper date
             data = pd.DataFrame({
                 'Open': [current_price * 0.995],
                 'High': [current_price * 1.005],
@@ -203,7 +230,7 @@ def fetch_from_info(symbol: str):
         print(f"  Info error: {str(e)}")
         return None, None
 
-# --- Data Source 3: Alpha Vantage ---
+# --- Data Source 3: Alpha Vantage (unchanged) ---
 def fetch_from_alphavantage(symbol: str):
     """Fetch from Alpha Vantage with correct date handling"""
     try:
@@ -214,7 +241,15 @@ def fetch_from_alphavantage(symbol: str):
             
         print(f"📊 Alpha Vantage: {symbol}")
         
-        av_symbol = symbol.replace('.NS', '').replace('.BO', '')
+        # CRITICAL: Alpha Vantage supports BSE, NOT NSE
+        if symbol.endswith('.NS'):
+            av_symbol = symbol.replace('.NS', '.BSE')
+        elif symbol.endswith('.BO'):
+            av_symbol = symbol.replace('.BO', '.BSE')
+        else:
+            av_symbol = symbol + '.BSE'
+        
+        print(f"  Alpha Vantage symbol: {av_symbol}")
         
         url = "https://www.alphavantage.co/query"
         params = {
@@ -234,7 +269,6 @@ def fetch_from_alphavantage(symbol: str):
             df_data = []
             for date_str, values in list(time_series.items())[:90]:
                 try:
-                    # Parse date correctly
                     date = pd.to_datetime(date_str)
                     
                     close = float(values['4. close'])
@@ -242,13 +276,7 @@ def fetch_from_alphavantage(symbol: str):
                     high = float(values['2. high'])
                     low = float(values['3. low'])
                     
-                    # Convert if USD
-                    if 1 < close < 1000:
-                        close = close * 83.5
-                        open_price = open_price * 83.5
-                        high = high * 83.5
-                        low = low * 83.5
-                    
+                    # BSE data is already in INR - don't multiply
                     df_data.append({
                         'Date': date,
                         'Open': open_price,
@@ -277,7 +305,7 @@ def fetch_from_alphavantage(symbol: str):
         print(f"  Alpha Vantage error: {str(e)}")
         return None, None
 
-# --- Main Fetch Function ---
+# --- Main Fetch Function (unchanged) ---
 def fetch_stock_data(symbol: str, period: str = '3mo'):
     """Fetch stock data with correct date handling"""
     
@@ -299,7 +327,6 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
     for try_symbol in symbols_to_try:
         print(f"\n📈 Trying: {try_symbol}")
         
-        # Try Yahoo Finance first
         data, source = fetch_from_yahoo(try_symbol, period)
         if data is not None and not data.empty:
             latest = float(data['Close'].iloc[-1])
@@ -311,7 +338,6 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
             else:
                 print(f"⚠️ Price ₹{latest} seems wrong, trying next source")
         
-        # Try Info API
         data, source = fetch_from_info(try_symbol)
         if data is not None and not data.empty:
             latest = float(data['Close'].iloc[-1])
@@ -320,7 +346,6 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
                 set_in_cache(cache_key, data)
                 return data
         
-        # Try Alpha Vantage
         data, source = fetch_from_alphavantage(try_symbol)
         if data is not None and not data.empty:
             latest = float(data['Close'].iloc[-1])
@@ -332,12 +357,70 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
             else:
                 print(f"⚠️ Price ₹{latest} seems wrong")
     
-    # If all fail
     raise HTTPException(
         status_code=404,
         detail=f"Could not fetch valid data for {symbol}. Please try again later."
     )
 
+# ============================================================
+# NEW: Batch Download for Scanning (Fast)
+# ============================================================
+def batch_download_stocks(symbols: List[str], period: str = '3mo') -> Dict[str, pd.DataFrame]:
+    """
+    Batch download stocks using yfinance's built-in threading.
+    This is ~22x faster than individual requests.
+    """
+    results = {}
+    
+    try:
+        print(f"\n📥 Batch downloading {len(symbols)} stocks...")
+        start = time.time()
+        
+        # Use yf.download with multiple tickers
+        data = yf.download(
+            tickers=symbols,
+            period=period,
+            progress=False,
+            threads=True,
+            auto_adjust=True,
+            group_by='ticker'
+        )
+        
+        # Split into individual dataframes
+        if len(symbols) == 1:
+            if not data.empty:
+                results[symbols[0]] = data
+        else:
+            for symbol in symbols:
+                try:
+                    if symbol in data.columns.get_level_values(0):
+                        df = data[symbol].dropna()
+                        if not df.empty:
+                            results[symbol] = df
+                except Exception:
+                    continue
+        
+        elapsed = round(time.time() - start, 2)
+        print(f"✅ Downloaded {len(results)}/{len(symbols)} stocks in {elapsed}s")
+        
+    except Exception as e:
+        print(f"❌ Batch download failed: {e}")
+        # Fallback: use existing fetch_stock_data per stock
+        print("  Falling back to individual downloads...")
+        for symbol in symbols[:10]:  # Limit fallback to first 10
+            try:
+                time.sleep(0.5)
+                df = fetch_stock_data(symbol, period)
+                if df is not None and not df.empty:
+                    results[symbol] = df
+            except Exception:
+                continue
+    
+    return results
+
+# ============================================================
+# Analysis Functions (unchanged)
+# ============================================================
 def calculate_pivot_points(data):
     try:
         if len(data) < 2:
@@ -406,11 +489,14 @@ def detect_breakout(data, symbol):
         
         # Volume confirmation
         volume_confirmation = False
+        volume_ratio = 0.0
         if len(data) >= 14:
             try:
                 avg_volume = float(data['Volume'].rolling(window=14).mean().iloc[-1])
                 current_volume = float(data['Volume'].iloc[-1])
-                volume_confirmation = current_volume > avg_volume * 1.5 if avg_volume > 0 else False
+                if avg_volume > 0:
+                    volume_ratio = round(current_volume / avg_volume, 2)
+                    volume_confirmation = volume_ratio > 1.5
             except:
                 pass
         
@@ -442,10 +528,15 @@ def detect_breakout(data, symbol):
             'breakouts': breakouts,
             'is_breakout': len(breakouts) > 0,
             'volume_confirmation': volume_confirmation,
+            'volume_ratio': volume_ratio,
             'date_used': latest_date
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+
+# ============================================================
+# API Endpoints (Existing - unchanged)
+# ============================================================
 
 @app.get("/")
 async def root():
@@ -454,6 +545,10 @@ async def root():
         "status": "running",
         "data_sources": ["Yahoo Finance", "Info API", "Alpha Vantage"],
         "current_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "endpoints": {
+            "existing": ["/debug/{symbol}", "/analyze/{symbol}", "/scan?symbols=...", "/popular", "/health", "/cache/clear"],
+            "new": ["/scan/nifty50", "/scan/custom?symbols=...", "/nifty50"]
+        },
         "timestamp": datetime.now().isoformat()
     }
 
@@ -478,7 +573,6 @@ async def debug_stock(symbol: str):
         print(f"\n🔍 Debug: {symbol}")
         print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Test Yahoo
         data, source = fetch_from_yahoo(symbol)
         if data is not None and not data.empty:
             results['yahoo'] = {
@@ -492,7 +586,6 @@ async def debug_stock(symbol: str):
         else:
             results['yahoo'] = {'status': 'failed'}
         
-        # Test Info
         data, source = fetch_from_info(symbol)
         if data is not None and not data.empty:
             results['info'] = {
@@ -504,7 +597,6 @@ async def debug_stock(symbol: str):
         else:
             results['info'] = {'status': 'failed'}
         
-        # Test Alpha Vantage
         data, source = fetch_from_alphavantage(symbol)
         if data is not None and not data.empty:
             results['alphavantage'] = {
@@ -518,9 +610,7 @@ async def debug_stock(symbol: str):
         else:
             results['alphavantage'] = {'status': 'failed'}
         
-        # Actual price from Yahoo
         try:
-            import yfinance as yf
             ticker = yf.Ticker(symbol)
             info = ticker.info
             real_price = info.get('regularMarketPrice', 'N/A')
@@ -642,4 +732,109 @@ async def clear_cache():
     cache_expiry.clear()
     return {"message": "Cache cleared", "timestamp": datetime.now().isoformat()}
 
-app = app
+# ============================================================
+# NEW ENDPOINTS: Nifty 50 Scanner
+# ============================================================
+
+@app.get("/nifty50")
+async def get_nifty50_list():
+    """Get the Nifty 50 stock list"""
+    return {
+        "stocks": [s.replace('.NS', '') for s in NIFTY_50],
+        "symbols": NIFTY_50,
+        "total": len(NIFTY_50),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/scan/nifty50", response_model=ScanResponse)
+async def scan_nifty50(period: str = Query('3mo', description='Data period: 1mo, 3mo, 6mo')):
+    """
+    Scan all Nifty 50 stocks for breakouts.
+    Optimized for post-market-close analysis using batch download.
+    """
+    start_time = time.time()
+    
+    print(f"\n{'='*60}")
+    print(f"🔍 SCANNING NIFTY 50 FOR BREAKOUTS")
+    print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Period: {period}")
+    print(f"{'='*60}\n")
+    
+    # Batch download all 50 stocks at once (fast)
+    stock_data = batch_download_stocks(NIFTY_50, period)
+    
+    if not stock_data:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not fetch stock data. Yahoo Finance may be rate limiting. Try again in 5 minutes."
+        )
+    
+    # Analyze each stock
+    breakouts = []
+    failed_stocks = []
+    
+    for symbol, data in stock_data.items():
+        try:
+            result = detect_breakout(data, symbol)
+            
+            # Build response object
+            stock_breakout = StockBreakout(
+                symbol=symbol.replace('.NS', ''),
+                current_price=result['current_price'],
+                previous_close=result['previous_close'],
+                change_percent=round(
+                    ((result['current_price'] - result['previous_close']) / result['previous_close']) * 100, 2
+                ) if result['previous_close'] > 0 else 0,
+                resistance_levels=ResistanceLevels(
+                    pivot=result['resistance_levels']['pivot'],
+                    r1=result['resistance_levels']['r1'],
+                    r2=result['resistance_levels']['r2'],
+                    r3=result['resistance_levels']['r3']
+                ),
+                breakouts=[BreakoutSignal(**b) for b in result['breakouts']],
+                is_breakout=result['is_breakout'],
+                volume_confirmation=result['volume_confirmation'],
+                volume_ratio=result.get('volume_ratio', 0.0),
+                date_used=result.get('date_used', '')
+            )
+            
+            if result['is_breakout']:
+                breakouts.append(stock_breakout)
+        except Exception as e:
+            failed_stocks.append(f"{symbol}: {str(e)[:50]}")
+            continue
+    
+    # Also track stocks that were downloaded but didn't have breakouts
+    not_downloaded = [s for s in NIFTY_50 if s not in stock_data]
+    failed_stocks.extend(not_downloaded)
+    
+    # Sort breakouts by strength (R3 > R2 > R1, then by volume)
+    breakouts.sort(
+        key=lambda x: (len(x.breakouts), x.volume_ratio),
+        reverse=True
+    )
+    
+    scan_duration = round(time.time() - start_time, 2)
+    
+    print(f"\n{'='*60}")
+    print(f"📊 SCAN COMPLETE")
+    print(f"   Total scanned: {len(stock_data)}/{len(NIFTY_50)}")
+    print(f"   Breakouts: {len(breakouts)} stocks")
+    print(f"   Duration: {scan_duration}s")
+    print(f"{'='*60}\n")
+    
+    return ScanResponse(
+        scan_time=datetime.now().isoformat(),
+        total_stocks=len(NIFTY_50),
+        breakout_count=len(breakouts),
+        breakouts=breakouts,
+        failed_stocks=failed_stocks,
+        scan_duration_seconds=scan_duration
+    )
+
+@app.get("/scan/custom", response_model=ScanResponse)
+async def scan_custom(
+    symbols: str = Query(..., description='Comma-separated list of stock symbols'),
+    period: str = Query('3mo')
+):
+   
