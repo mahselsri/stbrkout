@@ -73,6 +73,7 @@ class StockBreakout(BaseModel):
     volume_confirmation: bool
     volume_ratio: float
     date_used: str
+    data_source: str = "unknown"
 
 class ScanResponse(BaseModel):
     scan_time: str
@@ -173,16 +174,20 @@ def fetch_from_alphavantage(symbol: str):
     try:
         api_key = os.environ.get('ALPHA_VANTAGE_KEY', '')
         if not api_key:
+            print("  Alpha Vantage: No API key")
             return None, None
 
         print(f"Alpha Vantage: {symbol}")
 
+        # Alpha Vantage supports BSE, not NSE
         if symbol.endswith('.NS'):
             av_symbol = symbol.replace('.NS', '.BSE')
         elif symbol.endswith('.BO'):
             av_symbol = symbol.replace('.BO', '.BSE')
         else:
             av_symbol = symbol + '.BSE'
+
+        print(f"  AV symbol: {av_symbol}")
 
         url = "https://www.alphavantage.co/query"
         params = {
@@ -216,7 +221,16 @@ def fetch_from_alphavantage(symbol: str):
                 df = pd.DataFrame(df_data)
                 df.set_index('Date', inplace=True)
                 df.sort_index(inplace=True)
+                latest = float(df['Close'].iloc[-1])
+                print(f"  AV success: {len(df)} rows, latest: ₹{latest}")
                 return df, 'alphavantage'
+
+        if "Note" in data:
+            print(f"  AV rate limit: {data['Note'][:100]}")
+        elif "Information" in data:
+            print(f"  AV info: {data['Information'][:100]}")
+        else:
+            print(f"  AV unexpected response: {list(data.keys())}")
 
         return None, None
     except Exception as e:
@@ -263,11 +277,20 @@ def fetch_stock_data(symbol: str, period: str = '3mo'):
         detail=f"Could not fetch valid data for {symbol}. Please try again later."
     )
 
-# --- Batch Download for Scanning ---
+# --- Batch Download with Alpha Vantage Fallback ---
 def batch_download_stocks(symbols: List[str], period: str = '3mo') -> Dict[str, pd.DataFrame]:
+    """
+    Batch download stocks via Yahoo Finance.
+    Falls back to Alpha Vantage (BSE) for any that fail.
+    """
     results = {}
+    failed_symbols = []
+
+    # --- Yahoo batch download ---
     try:
-        print(f"Batch downloading {len(symbols)} stocks...")
+        print(f"\n📥 Batch downloading {len(symbols)} stocks via Yahoo...")
+        start = time.time()
+
         data = yf.download(
             tickers=symbols,
             period=period,
@@ -285,23 +308,54 @@ def batch_download_stocks(symbols: List[str], period: str = '3mo') -> Dict[str, 
                 try:
                     if symbol in data.columns.get_level_values(0):
                         df = data[symbol].dropna()
-                        if not df.empty:
+                        if not df.empty and len(df) >= 5:
                             results[symbol] = df
+                        else:
+                            failed_symbols.append(symbol)
+                    else:
+                        failed_symbols.append(symbol)
                 except Exception:
-                    continue
+                    failed_symbols.append(symbol)
 
-        print(f"Downloaded {len(results)}/{len(symbols)} stocks")
+        elapsed = round(time.time() - start, 2)
+        print(f"✅ Yahoo batch: {len(results)}/{len(symbols)} stocks in {elapsed}s")
+        if failed_symbols:
+            print(f"⚠️ Failed from Yahoo: {len(failed_symbols)} stocks")
+
     except Exception as e:
-        print(f"Batch download failed: {e}")
-        for symbol in symbols[:10]:
+        print(f"❌ Yahoo batch failed: {e}")
+        failed_symbols = list(symbols)
+
+    # --- Alpha Vantage fallback for failed stocks ---
+    if failed_symbols and os.environ.get('ALPHA_VANTAGE_KEY'):
+        print(f"\n🔄 Alpha Vantage fallback for {len(failed_symbols)} stocks...")
+
+        # AV free tier: 5 requests/minute → limit to 5 per scan
+        max_av_attempts = min(len(failed_symbols), 5)
+        av_success = 0
+
+        for i, symbol in enumerate(failed_symbols[:max_av_attempts]):
             try:
-                time.sleep(0.5)
-                df = fetch_stock_data(symbol, period)
+                # Delay between AV requests to avoid rate limits
+                if i > 0:
+                    time.sleep(2)
+
+                df, source = fetch_from_alphavantage(symbol)
                 if df is not None and not df.empty:
                     results[symbol] = df
-            except Exception:
+                    av_success += 1
+                    print(f"  ✅ AV added: {symbol}")
+                else:
+                    print(f"  ❌ AV failed: {symbol}")
+            except Exception as e:
+                print(f"  ❌ AV error {symbol}: {e}")
                 continue
 
+        print(f"✅ Alpha Vantage added: {av_success} stocks")
+    elif failed_symbols:
+        print(f"⚠️ {len(failed_symbols)} stocks failed — no ALPHA_VANTAGE_KEY set")
+
+    print(f"\n📊 Total stocks ready: {len(results)}/{len(symbols)}\n")
     return results
 
 # --- Analysis Functions ---
@@ -426,6 +480,7 @@ async def root():
     return {
         "message": "Stock Breakout Detection API",
         "status": "running",
+        "data_sources": ["Yahoo Finance", "Info API", "Alpha Vantage (BSE)"],
         "endpoints": {
             "existing": ["/debug/{symbol}", "/analyze/{symbol}", "/scan?symbols=...", "/popular", "/health", "/cache/clear"],
             "new": ["/scan/nifty50", "/scan/custom?symbols=...", "/nifty50"]
@@ -435,7 +490,12 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "cache_size": len(cache), "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "cache_size": len(cache),
+        "alpha_vantage_configured": bool(os.environ.get('ALPHA_VANTAGE_KEY')),
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.get("/debug/{symbol}")
 async def debug_stock(symbol: str):
@@ -479,16 +539,6 @@ async def debug_stock(symbol: str):
             }
         else:
             results['alphavantage'] = {'status': 'failed'}
-
-        try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            results['actual'] = {
-                'price': info.get('regularMarketPrice', 'N/A'),
-                'currency': info.get('currency', 'N/A')
-            }
-        except:
-            results['actual'] = {'price': 'N/A', 'currency': 'N/A'}
 
         results['server_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -617,7 +667,7 @@ async def scan_nifty50(period: str = Query('3mo', description='Data period: 1mo,
     if not stock_data:
         raise HTTPException(
             status_code=503,
-            detail="Could not fetch stock data. Yahoo Finance may be rate limiting. Try again in 5 minutes."
+            detail="Could not fetch stock data. Yahoo Finance and Alpha Vantage both failed. Try again in 5 minutes."
         )
 
     breakouts = []
@@ -628,7 +678,7 @@ async def scan_nifty50(period: str = Query('3mo', description='Data period: 1mo,
             result = detect_breakout(data, symbol)
 
             stock_breakout = StockBreakout(
-                symbol=symbol.replace('.NS', ''),
+                symbol=symbol.replace('.NS', '').replace('.BO', ''),
                 current_price=result['current_price'],
                 previous_close=result['previous_close'],
                 change_percent=round(
@@ -644,7 +694,8 @@ async def scan_nifty50(period: str = Query('3mo', description='Data period: 1mo,
                 is_breakout=result['is_breakout'],
                 volume_confirmation=result['volume_confirmation'],
                 volume_ratio=result.get('volume_ratio', 0.0),
-                date_used=result.get('date_used', '')
+                date_used=result.get('date_used', ''),
+                data_source="yahoo" if symbol.endswith('.NS') else "alphavantage"
             )
 
             if result['is_breakout']:
@@ -680,7 +731,7 @@ async def scan_custom(
 
     symbol_list = [s.strip().upper() for s in symbols.split(',')]
     symbol_list = [s if '.' in s else s + '.NS' for s in symbol_list]
-    symbol_list = symbol_list[:20]  # Limit to 20 for rate limiting
+    symbol_list = symbol_list[:20]
 
     stock_data = batch_download_stocks(symbol_list, period)
 
@@ -695,7 +746,7 @@ async def scan_custom(
             result = detect_breakout(data, symbol)
 
             stock_breakout = StockBreakout(
-                symbol=symbol.replace('.NS', ''),
+                symbol=symbol.replace('.NS', '').replace('.BO', ''),
                 current_price=result['current_price'],
                 previous_close=result['previous_close'],
                 change_percent=round(
@@ -711,7 +762,8 @@ async def scan_custom(
                 is_breakout=result['is_breakout'],
                 volume_confirmation=result['volume_confirmation'],
                 volume_ratio=result.get('volume_ratio', 0.0),
-                date_used=result.get('date_used', '')
+                date_used=result.get('date_used', ''),
+                data_source="yahoo" if symbol.endswith('.NS') else "alphavantage"
             )
 
             if result['is_breakout']:
