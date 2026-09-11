@@ -699,6 +699,19 @@ async def clear_cache():
     cache_expiry.clear()
     return {"message": "Cache cleared", "timestamp": datetime.now().isoformat()}
 
+@app.get("/test-telegram")
+async def test_telegram():
+    """Test endpoint to verify Telegram is working"""
+    ok = send_telegram_message(
+        "🧪 *Test message from Breakout Scanner*\n"
+        "If you see this, Telegram is configured correctly!"
+    )
+    return {
+        "sent": ok,
+        "telegram_configured": bool(os.environ.get('TELEGRAM_BOT_TOKEN') and os.environ.get('TELEGRAM_CHAT_ID')),
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.get("/nifty50")
 async def get_nifty50_list():
     return {
