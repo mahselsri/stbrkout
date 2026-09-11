@@ -945,7 +945,7 @@ async def scan_nifty500(
             f"📅 {datetime.now().strftime('%Y-%m-%d')}",
             f"⏱ Scanned: {len(all_stock_data)} stocks",
             f"🎯 Breakouts: {len(breakouts)}\n",
-            "*Top Breakouts:*"
+            "*Top Breakouts from nifty:*"
         ]
 
         for b in breakouts[:30]:
