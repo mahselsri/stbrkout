@@ -330,13 +330,12 @@ def batch_download_stocks(symbols: List[str], period: str = '3mo') -> Dict[str, 
     if failed_symbols and os.environ.get('ALPHA_VANTAGE_KEY'):
         print(f"\n🔄 Alpha Vantage fallback for {len(failed_symbols)} stocks...")
 
-        # AV free tier: 5 requests/minute → limit to 5 per scan
+        # AV free tier: 5 requests/minute → limit to 5 per batch
         max_av_attempts = min(len(failed_symbols), 5)
         av_success = 0
 
         for i, symbol in enumerate(failed_symbols[:max_av_attempts]):
             try:
-                # Delay between AV requests to avoid rate limits
                 if i > 0:
                     time.sleep(2)
 
@@ -472,6 +471,61 @@ def detect_breakout(data, symbol):
         raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
 
 # ============================================================
+# Telegram Notification
+# ============================================================
+def send_telegram_message(message: str):
+    """Send a message to Telegram"""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+    if not token or not chat_id:
+        print("⚠️ Telegram not configured")
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("✅ Telegram sent")
+            return True
+        else:
+            print(f"❌ Telegram error: {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ Telegram exception: {e}")
+        return False
+
+# ============================================================
+# Nifty 500 - fetched live from NSE
+# ============================================================
+NIFTY500_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+def get_nifty500_symbols() -> List[str]:
+    """Fetch Nifty 500 symbols from NSE"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(NIFTY500_URL, headers=headers, timeout=15)
+        response.raise_for_status()
+
+        from io import StringIO
+        df = pd.read_csv(StringIO(response.text))
+        symbols = df['Symbol'].astype(str).str.strip().tolist()
+        yahoo_symbols = [f"{s}.NS" for s in symbols if s and s != 'nan']
+        print(f"✅ Loaded {len(yahoo_symbols)} Nifty 500 symbols")
+        return yahoo_symbols
+    except Exception as e:
+        print(f"❌ Failed to fetch Nifty 500: {e}")
+        return []
+
+# ============================================================
 # Endpoints
 # ============================================================
 
@@ -483,7 +537,7 @@ async def root():
         "data_sources": ["Yahoo Finance", "Info API", "Alpha Vantage (BSE)"],
         "endpoints": {
             "existing": ["/debug/{symbol}", "/analyze/{symbol}", "/scan?symbols=...", "/popular", "/health", "/cache/clear"],
-            "new": ["/scan/nifty50", "/scan/custom?symbols=...", "/nifty50"]
+            "scan": ["/scan/nifty50", "/scan/nifty500", "/scan/custom?symbols=...", "/nifty50"]
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -494,6 +548,7 @@ async def health_check():
         "status": "healthy",
         "cache_size": len(cache),
         "alpha_vantage_configured": bool(os.environ.get('ALPHA_VANTAGE_KEY')),
+        "telegram_configured": bool(os.environ.get('TELEGRAM_BOT_TOKEN') and os.environ.get('TELEGRAM_CHAT_ID')),
         "timestamp": datetime.now().isoformat()
     }
 
@@ -785,6 +840,143 @@ async def scan_custom(
         breakout_count=len(breakouts),
         breakouts=breakouts,
         failed_stocks=failed_stocks,
+        scan_duration_seconds=scan_duration
+    )
+
+@app.get("/scan/nifty500")
+async def scan_nifty500(
+    period: str = Query('3mo', description='Data period'),
+    send_telegram: bool = Query(True, description='Send Telegram report'),
+    min_volume_ratio: float = Query(0.0, description='Min volume ratio filter')
+):
+    """
+    Scan all Nifty 500 stocks for breakouts.
+    Batches Yahoo requests, falls back to Alpha Vantage, sends Telegram report.
+    """
+    start_time = time.time()
+
+    print(f"\n{'='*60}")
+    print(f"SCANNING NIFTY 500 FOR BREAKOUTS")
+    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}\n")
+
+    # 1. Get stock list
+    symbols = get_nifty500_symbols()
+    if not symbols:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not fetch Nifty 500 list from NSE. Try again later."
+        )
+
+    # 2. Batch download
+    BATCH_SIZE = 100
+    SLEEP_BETWEEN_BATCHES = 2
+
+    all_stock_data = {}
+    failed_all = []
+
+    total_batches = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        batch_num = i // BATCH_SIZE + 1
+
+        print(f"\n📦 Batch {batch_num}/{total_batches} ({len(batch)} stocks)")
+
+        batch_data = batch_download_stocks(batch, period)
+        all_stock_data.update(batch_data)
+
+        batch_failed = [s for s in batch if s not in batch_data]
+        failed_all.extend(batch_failed)
+
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(SLEEP_BETWEEN_BATCHES)
+
+    print(f"\n📊 Downloaded: {len(all_stock_data)}/{len(symbols)} stocks")
+
+    if not all_stock_data:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not fetch any stock data. All sources failed."
+        )
+
+    # 3. Detect breakouts
+    breakouts = []
+    for symbol, data in all_stock_data.items():
+        try:
+            result = detect_breakout(data, symbol)
+
+            if result['is_breakout']:
+                if result.get('volume_ratio', 0) < min_volume_ratio:
+                    continue
+
+                stock_breakout = StockBreakout(
+                    symbol=symbol.replace('.NS', '').replace('.BO', ''),
+                    current_price=result['current_price'],
+                    previous_close=result['previous_close'],
+                    change_percent=round(
+                        ((result['current_price'] - result['previous_close']) / result['previous_close']) * 100, 2
+                    ) if result['previous_close'] > 0 else 0,
+                    resistance_levels=ResistanceLevels(
+                        pivot=result['resistance_levels']['pivot'],
+                        r1=result['resistance_levels']['r1'],
+                        r2=result['resistance_levels']['r2'],
+                        r3=result['resistance_levels']['r3']
+                    ),
+                    breakouts=[BreakoutSignal(**b) for b in result['breakouts']],
+                    is_breakout=result['is_breakout'],
+                    volume_confirmation=result['volume_confirmation'],
+                    volume_ratio=result.get('volume_ratio', 0.0),
+                    date_used=result.get('date_used', ''),
+                    data_source="yahoo" if symbol.endswith('.NS') else "alphavantage"
+                )
+                breakouts.append(stock_breakout)
+        except Exception:
+            continue
+
+    breakouts.sort(key=lambda x: (len(x.breakouts), x.volume_ratio), reverse=True)
+
+    scan_duration = round(time.time() - start_time, 2)
+
+    # 4. Send Telegram report
+    if send_telegram and breakouts:
+        report_lines = [
+            f"📈 *Breakout Report — Nifty 500*",
+            f"📅 {datetime.now().strftime('%Y-%m-%d')}",
+            f"⏱ Scanned: {len(all_stock_data)} stocks",
+            f"🎯 Breakouts: {len(breakouts)}\n",
+            "*Top Breakouts:*"
+        ]
+
+        for b in breakouts[:30]:
+            vol_icon = "🔥" if b.volume_ratio >= 1.5 else ""
+            levels = "/".join([bo.level for bo in b.breakouts])
+            report_lines.append(
+                f"• *{b.symbol}*: ₹{b.current_price} "
+                f"({b.change_percent:+.1f}%) | {levels} | Vol {b.volume_ratio}x {vol_icon}"
+            )
+
+        if len(breakouts) > 30:
+            report_lines.append(f"\n_... and {len(breakouts) - 30} more_")
+
+        report_lines.append(f"\n⚠️ _Not investment advice_")
+
+        send_telegram_message("\n".join(report_lines))
+    elif send_telegram:
+        send_telegram_message(
+            f"📈 *Breakout Report — Nifty 500*\n"
+            f"📅 {datetime.now().strftime('%Y-%m-%d')}\n\n"
+            f"Scanned {len(all_stock_data)} stocks. No breakouts found today."
+        )
+
+    print(f"\n✅ SCAN COMPLETE: {len(breakouts)} breakouts in {scan_duration}s\n")
+
+    return ScanResponse(
+        scan_time=datetime.now().isoformat(),
+        total_stocks=len(symbols),
+        breakout_count=len(breakouts),
+        breakouts=breakouts,
+        failed_stocks=failed_all[:100],
         scan_duration_seconds=scan_duration
     )
 
